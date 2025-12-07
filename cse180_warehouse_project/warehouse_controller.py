@@ -1,1508 +1,675 @@
 #!/usr/bin/env python3
 """
-Map-Aware Warehouse Human Detection Controller (FULLY FIXED VERSION)
-=====================================================================
+Warehouse Human Detection Controller (VERSION 3 - SMART APPROACH)
+==================================================================
 
-FIXES APPLIED:
-1. TF listener for reliable robot pose (AMCL doesn't publish frequently)
-2. Fallback pose estimation from navigation
-3. Improved scan timing to ensure fresh data
-4. More robust pose waiting
-5. FIXED: Navigation now approaches from robot's side (not through walls!)
-6. FIXED: Proper localization reset for re-runs (no more hallucinated walls)
+KEY FIX: Robot now finds an OPEN SPACE approach point around the person,
+instead of blindly calculating a point that might be behind a shelf/wall.
+
+The robot checks multiple directions around the person and picks the
+first one that is:
+1. Not blocked by obstacles in the map
+2. Navigable by the robot
 
 Author: ROS2 Tutorial
 For: ROS2 Jazzy + Nav2 + Gazebo
 """
 
-# =============================================================================
-# IMPORTS
-# =============================================================================
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
-import rclpy                                    # ROS2 Python client library - the main interface for ROS2
-from rclpy.node import Node                     # Base class that all ROS2 nodes inherit from
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy  # Quality of Service settings for subscribers/publishers
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import OccupancyGrid
 
-# Message types - these define the structure of data sent between nodes
-from geometry_msgs.msg import PoseStamped                   # A pose (position + orientation) with a timestamp and frame
-from geometry_msgs.msg import PoseWithCovarianceStamped     # Pose with uncertainty information (from AMCL)
-from sensor_msgs.msg import LaserScan                       # Laser scanner data (distances at various angles)
-from nav_msgs.msg import OccupancyGrid                      # 2D map data (grid of occupied/free/unknown cells)
+from tf2_ros import Buffer, TransformListener
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 
-# TF2 for getting robot pose from transform tree
-# TF (Transform) is ROS's system for tracking coordinate frames over time
-from tf2_ros import Buffer, TransformListener              # Buffer stores transforms, Listener subscribes to /tf
-from tf2_ros import LookupException, ConnectivityException, ExtrapolationException  # Possible TF errors
-
-# Nav2 Simple Commander - high-level navigation interface
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 
-# Standard Python libraries
-import math                 # Mathematical functions (sin, cos, atan2, sqrt)
-import numpy as np          # Numerical operations on arrays
-import time                 # Time delays and timestamps
+import math
+import numpy as np
+import time
 
 
-# =============================================================================
-# MAIN CONTROLLER CLASS
-# =============================================================================
-
-class MapAwareWarehouseController(Node):
+class WarehouseController(Node):
     """
-    Complete warehouse human detection system with FIXED pose handling
-    and proper re-run support.
-    
-    This node:
-    1. Navigates to expected person locations
-    2. Uses laser scans + map comparison to detect humans (dynamic objects)
-    3. Searches the warehouse if people aren't at expected locations
-    4. Reports findings
-    
-    Inherits from Node - the base class for all ROS2 Python nodes.
+    Warehouse human detection with SMART approach point selection.
     """
     
     def __init__(self):
-        """
-        Initialize the node, subscribers, and parameters.
+        super().__init__('warehouse_controller')
         
-        This is called once when the node is created.
-        Sets up all ROS2 communication (subscribers, publishers, timers)
-        and initializes state variables.
-        """
-        # Initialize the parent Node class with our node name
-        # This name appears in 'ros2 node list' and log messages
-        super().__init__('map_aware_warehouse_controller')
+        self.shutting_down = False
         
         # =====================================================================
-        # CONFIGURATION PARAMETERS
+        # CONFIGURATION
         # =====================================================================
-        # These values control the robot's behavior
-        # You can tune these based on your environment
         
-        # Expected person positions (from your Gazebo screenshots)
-        # These are the locations where we expect to find people
-        self.person1_expected = {
-            'x': 1.00,          # X coordinate in meters (map frame)
-            'y': -1.00,         # Y coordinate in meters (map frame)
-            'name': 'Person 1 - Standing'  # Human-readable name for logging
-        }
+        self.person1_expected = {'x': 1.00, 'y': -1.00, 'name': 'Person 1'}
+        self.person2_expected = {'x': -12.00, 'y': 15.00, 'name': 'Person 2'}
         
-        self.person2_expected = {
-            'x': -12.00,        # X coordinate in meters
-            'y': 15.00,         # Y coordinate in meters
-            'name': 'Person 2 - Walking'
-        }
+        self.robot_start = {'x': 2.12, 'y': -21.3, 'yaw': 1.57}
         
-        # Robot's starting position (must match Gazebo spawn point)
-        # Used for initial localization and as fallback pose
-        self.robot_start = {
-            'x': 2.12,          # Starting X position
-            'y': -21.3,         # Starting Y position
-            'yaw': 1.57         # Starting orientation (radians) - 1.57 ≈ 90° = facing +Y
-        }
-        
-        # Detection parameters - TUNED for better detection
-        # These control how we identify humans from laser scan data
         self.detection_config = {
-            # Navigation settings
-            'approach_distance': 2.0,       # How far from person to stop (meters)
+            # Approach settings - INCREASED distance for safety
+            'approach_distance': 3.0,       # Stay 3m away from person
+            'min_approach_distance': 2.0,   # Minimum if 3m is blocked
             
-            # Laser scan filtering - ignore readings outside this range
-            'scan_range_min': 0.3,          # Minimum valid distance (meters) - filters out noise
-            'scan_range_max': 5.0,          # Maximum detection distance (meters)
+            # Angles to try around the person (degrees from +X axis)
+            # Starts with common open directions, then tries all around
+            'approach_angles_deg': [
+                180,    # Behind (relative to typical shelf layout)
+                -90,    # Left
+                90,     # Right  
+                -135,   # Back-left
+                135,    # Back-right
+                -45,    # Front-left
+                45,     # Front-right
+                0,      # In front
+            ],
             
-            # Human identification thresholds
-            # Humans typically appear as clusters of points with specific width
-            'human_width_min': 0.10,        # Minimum width to be considered human (meters)
-            'human_width_max': 1.2,         # Maximum width (larger = furniture/wall)
-            'min_cluster_points': 3,        # Minimum laser points in a cluster
-            'max_cluster_points': 100,      # Maximum points (larger = wall, not person)
-            'cluster_gap_threshold': 8,     # Max index gap between points in same cluster
-            
-            # Map comparison settings
-            'map_obstacle_threshold': 50,   # Occupancy value above this = obstacle (0-100 scale)
-            'dynamic_object_buffer': 0.15,  # Buffer zone around static obstacles (meters)
-            
-            # Detection confidence settings
-            'num_scans_to_check': 5,        # Number of scans for majority voting
-            'detection_threshold': 2,       # Minimum positive detections to confirm
+            # Laser/detection settings
+            'scan_range_min': 0.3,
+            'scan_range_max': 5.0,
+            'human_width_min': 0.10,
+            'human_width_max': 1.2,
+            'min_cluster_points': 3,
+            'max_cluster_points': 100,
+            'cluster_gap_threshold': 8,
+            'map_obstacle_threshold': 50,
+            'dynamic_object_buffer': 0.15,
+            'num_scans_to_check': 5,
+            'detection_threshold': 2,
         }
         
-        # Search waypoints - places to check if people aren't at expected locations
-        # These should cover the navigable areas of your warehouse
-        self.search_waypoints = [
-            {'x': 0.0, 'y': 0.0},
-            {'x': 5.0, 'y': 0.0},
-            {'x': 5.0, 'y': 5.0},
-            {'x': 0.0, 'y': 5.0},
-            {'x': -5.0, 'y': 5.0},
-            {'x': -5.0, 'y': 10.0},
-            {'x': -10.0, 'y': 10.0},
-            {'x': -10.0, 'y': 5.0},
-            {'x': -10.0, 'y': 0.0},
-            {'x': -5.0, 'y': 0.0},
-            {'x': -5.0, 'y': -5.0},
-            {'x': 0.0, 'y': -5.0},
-            {'x': 0.0, 'y': -10.0},
-            {'x': 5.0, 'y': -10.0},
-        ]
+        # =====================================================================
+        # STATE
+        # =====================================================================
+        
+        self.person1_found = None
+        self.person2_found = None
+        self.map_data = None
+        self.map_info = None
+        self.latest_scan = None
+        self.robot_pose = None
+        self.map_received = False
+        self.mission_started = False
         
         # =====================================================================
-        # STATE VARIABLES
+        # TF2
         # =====================================================================
-        # These track the current state of the mission
         
-        self.person1_found = None           # True/False/None - was person 1 at expected location?
-        self.person2_found = None           # True/False/None - was person 2 at expected location?
-        self.person1_new_location = None    # Dict with x,y if found during search
-        self.person2_new_location = None    # Dict with x,y if found during search
-        
-        self.map_data = None                # 2D numpy array of occupancy values
-        self.map_info = None                # Metadata about the map (resolution, origin, size)
-        self.latest_scan = None             # Most recent LaserScan message
-        self.robot_pose = None              # Pose from AMCL topic (backup method)
-        self.last_known_pose = None         # Fallback pose storage for reliability
-        
-        self.mission_started = False        # Prevents mission from running twice
-        self.map_received = False           # True once we've received map data
-        self.localization_initialized = False  # True once localization is verified
-        
-        # =====================================================================
-        # TF2 BUFFER AND LISTENER
-        # =====================================================================
-        # TF (Transform) system provides real-time robot pose
-        # This is MORE RELIABLE than waiting for AMCL topic publications
-        #
-        # The TF tree looks like:
-        #   map -> odom -> base_link
-        # Where:
-        #   - map: Fixed world frame (from SLAM/localization)
-        #   - odom: Odometry frame (drifts over time)
-        #   - base_link: Robot's body frame
-        #
-        # We want map -> base_link to know robot's position in the world
-        
-        self.tf_buffer = Buffer(
-            cache_time=rclpy.duration.Duration(seconds=10.0)  # Shorter cache for re-runs
-        )
-        # TransformListener automatically subscribes to /tf and /tf_static
-        # and populates the buffer with transforms
+        self.tf_buffer = Buffer(cache_time=rclpy.duration.Duration(seconds=30.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.get_logger().info('TF listener initialized for pose tracking')
         
         # =====================================================================
         # SUBSCRIBERS
         # =====================================================================
-        # Subscribers receive messages published by other nodes
         
-        # Map subscriber with transient local QoS
-        # QoS (Quality of Service) settings control message delivery guarantees
         map_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,      # Guaranteed delivery
-            durability=DurabilityPolicy.TRANSIENT_LOCAL, # Late subscribers get last message
-            depth=1                                       # Only keep 1 message in queue
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1
         )
         
-        # Subscribe to the /map topic (published by map_server or SLAM)
-        # When a message arrives, map_callback() is called
         self.map_sub = self.create_subscription(
-            OccupancyGrid,          # Message type
-            '/map',                 # Topic name
-            self.map_callback,      # Callback function
-            map_qos                 # QoS profile
-        )
-        self.get_logger().info('Subscribed to /map topic')
-        
-        # Laser scan subscriber - uses default QoS (best effort, volatile)
-        # Laser data arrives at high frequency (10-40 Hz typically)
+            OccupancyGrid, '/map', self.map_callback, map_qos)
         self.scan_sub = self.create_subscription(
-            LaserScan,              # Message type containing distance measurements
-            '/scan',                # Topic name (from lidar driver)
-            self.scan_callback,     # Callback function
-            10                      # Queue depth (integer = default QoS with this depth)
-        )
-        self.get_logger().info('Subscribed to /scan topic')
-        
-        # AMCL pose subscriber (as backup to TF)
-        # AMCL publishes when the pose estimate changes significantly
+            LaserScan, '/scan', self.scan_callback, 10)
         self.pose_sub = self.create_subscription(
-            PoseWithCovarianceStamped,  # Pose with uncertainty covariance matrix
-            '/amcl_pose',               # Topic from AMCL localization
-            self.pose_callback,         # Callback function
-            10                          # Queue depth
-        )
-        self.get_logger().info('Subscribed to /amcl_pose topic')
+            PoseWithCovarianceStamped, '/amcl_pose', self.pose_callback, 10)
         
         # =====================================================================
         # NAVIGATOR
         # =====================================================================
-        # BasicNavigator is a high-level interface to Nav2
-        # It handles path planning, obstacle avoidance, and recovery behaviors
         
         self.navigator = BasicNavigator()
         
         # =====================================================================
         # STARTUP
         # =====================================================================
-        # Print startup banner and schedule mission start
         
-        self.get_logger().info('')
         self.get_logger().info('=' * 60)
-        self.get_logger().info('  MAP-AWARE WAREHOUSE CONTROLLER (FULLY FIXED)')
+        self.get_logger().info('  WAREHOUSE CONTROLLER v3 - SMART APPROACH')
         self.get_logger().info('=' * 60)
-        self.get_logger().info(f'  Person 1 expected: ({self.person1_expected["x"]}, {self.person1_expected["y"]})')
-        self.get_logger().info(f'  Person 2 expected: ({self.person2_expected["x"]}, {self.person2_expected["y"]})')
+        self.get_logger().info(f'  Person 1: ({self.person1_expected["x"]}, {self.person1_expected["y"]})')
+        self.get_logger().info(f'  Person 2: ({self.person2_expected["x"]}, {self.person2_expected["y"]})')
         self.get_logger().info('=' * 60)
-        self.get_logger().info('')
         
-        # Create a one-shot timer to start the mission after 5 seconds
-        # This gives time for other nodes to start and publish data
-        self.create_timer(5.0, self.start_mission_once)
+        self.create_timer(3.0, self.start_mission_once)
     
     
     # =========================================================================
-    # CALLBACK FUNCTIONS
+    # CALLBACKS
     # =========================================================================
-    # Callbacks are called automatically when messages arrive on subscribed topics
     
     def map_callback(self, msg):
-        """
-        Store map data when received.
-        
-        Called automatically when a message is published to /map.
-        
-        Parameters:
-            msg (OccupancyGrid): The map message containing:
-                - info: Metadata (width, height, resolution, origin)
-                - data: Flat array of occupancy values (-1=unknown, 0=free, 100=occupied)
-        """
-        # Store the metadata (resolution, size, origin position)
         self.map_info = msg.info
-        
-        # Convert flat array to 2D numpy array for easier indexing
-        # msg.data is a flat list, we reshape it to (height, width)
         self.map_data = np.array(msg.data, dtype=np.int8).reshape(
-            (msg.info.height, msg.info.width)
-        )
-        
-        # Log info only on first reception
+            (msg.info.height, msg.info.width))
         if not self.map_received:
             self.map_received = True
-            self.get_logger().info(
-                f'✓ Map received: {msg.info.width} x {msg.info.height} pixels, '
-                f'resolution: {msg.info.resolution:.3f} m/pixel'
-            )
-            self.get_logger().info(
-                f'  Map origin: ({msg.info.origin.position.x:.2f}, '
-                f'{msg.info.origin.position.y:.2f})'
-            )
-    
+            self.get_logger().info(f'✓ Map received: {msg.info.width}x{msg.info.height}')
     
     def scan_callback(self, msg):
-        """
-        Store latest laser scan.
-        
-        Called automatically when a message is published to /scan.
-        We just store it; processing happens when we actively scan for humans.
-        
-        Parameters:
-            msg (LaserScan): Laser scan data containing:
-                - ranges: Array of distance measurements
-                - angle_min/max: Start and end angles of scan
-                - angle_increment: Angle between consecutive readings
-        """
         self.latest_scan = msg
     
-    
     def pose_callback(self, msg):
-        """
-        Store pose from AMCL (used as backup to TF).
-        
-        Called when AMCL publishes a pose update (not every frame!).
-        AMCL only publishes when the estimated pose changes significantly.
-        
-        Parameters:
-            msg (PoseWithCovarianceStamped): Contains:
-                - pose.pose: The estimated pose (position + orientation)
-                - pose.covariance: 6x6 uncertainty matrix
-        """
         self.robot_pose = msg.pose.pose
-        self.last_known_pose = msg.pose.pose  # Keep as fallback
-        self.get_logger().debug(
-            f'AMCL pose received: ({msg.pose.pose.position.x:.2f}, '
-            f'{msg.pose.pose.position.y:.2f})'
-        )
     
     
     # =========================================================================
-    # LOCALIZATION RESET (FIX FOR RE-RUN ISSUES!)
+    # LOCALIZATION
     # =========================================================================
     
     def reset_localization(self):
-        """
-        Properly reset the localization system before starting.
+        """Reset AMCL localization."""
+        self.get_logger().info('Resetting localization...')
         
-        This clears old state and ensures AMCL re-initializes correctly.
-        
-        WHY THIS IS NEEDED:
-        - When you re-run the controller, Gazebo resets the robot position
-        - But AMCL still thinks the robot is at its LAST position
-        - The TF buffer has cached old transforms
-        - Costmaps have obstacles placed based on old (wrong) poses
-        
-        This function:
-        1. Clears the TF buffer
-        2. Resets cached poses
-        3. Publishes initial pose to AMCL multiple times
-        4. Waits for AMCL to converge
-        5. Clears costmaps
-        6. Verifies the pose is correct
-        """
-        self.get_logger().info('Resetting localization system...')
-        
-        # ---------------------------------------------------------------------
-        # Step 1: Clear the TF buffer (remove stale transforms)
-        # ---------------------------------------------------------------------
-        # Old transforms from previous run will give wrong poses
-        self.tf_buffer.clear()
-        self.get_logger().info('  ✓ TF buffer cleared')
-        
-        # ---------------------------------------------------------------------
-        # Step 2: Reset stored poses
-        # ---------------------------------------------------------------------
-        # Clear any cached pose data from previous run
-        self.robot_pose = None
-        self.last_known_pose = None
-        self.get_logger().info('  ✓ Cached poses cleared')
-        
-        # ---------------------------------------------------------------------
-        # Step 3: Set initial pose MULTIPLE times
-        # ---------------------------------------------------------------------
-        # AMCL uses a particle filter - publishing initial pose resets particles
-        # Publishing multiple times helps ensure AMCL receives and processes it
         initial_pose = self.create_pose_stamped(
             self.robot_start['x'],
             self.robot_start['y'],
             self.robot_start['yaw']
         )
         
-        # Publish initial pose several times to ensure AMCL receives it
-        for i in range(3):
+        for _ in range(5):
             self.navigator.setInitialPose(initial_pose)
-            time.sleep(0.5)  # Wait between publications
-            rclpy.spin_once(self, timeout_sec=0.1)  # Process any callbacks
-        self.get_logger().info('  ✓ Initial pose published (3x)')
-        
-        # ---------------------------------------------------------------------
-        # Step 4: Wait for AMCL to re-initialize particles
-        # ---------------------------------------------------------------------
-        # AMCL needs time to:
-        # - Receive the initial pose
-        # - Spread particles around the initial pose
-        # - Converge particles based on sensor data
-        self.get_logger().info('  Waiting for AMCL to converge...')
-        time.sleep(3.0)  # Give AMCL time to process
-        
-        # ---------------------------------------------------------------------
-        # Step 5: Spin to process incoming messages and update TF
-        # ---------------------------------------------------------------------
-        # This processes callbacks to get fresh pose data
-        for _ in range(50):
+            time.sleep(0.3)
             rclpy.spin_once(self, timeout_sec=0.1)
         
-        # ---------------------------------------------------------------------
-        # Step 6: Clear costmaps (removes hallucinated walls!)
-        # ---------------------------------------------------------------------
-        # Costmaps contain obstacles from laser scans placed at OLD (wrong) poses
-        # We need to clear them so they rebuild with correct pose
-        self.get_logger().info('  Clearing costmaps...')
+        self.get_logger().info('  Waiting for AMCL...')
+        for i in range(50):
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if i % 10 == 0:
+                pose = self.get_pose_from_tf()
+                if pose:
+                    self.get_logger().info(f'  ✓ TF ready: ({pose[0]:.2f}, {pose[1]:.2f})')
+                    break
+        
         try:
             self.navigator.clearAllCostmaps()
-            time.sleep(1.0)  # Wait for costmaps to clear
+            time.sleep(1.0)
             self.get_logger().info('  ✓ Costmaps cleared')
-        except Exception as e:
-            self.get_logger().warn(f'  ⚠ Could not clear costmaps: {e}')
+        except:
+            pass
         
-        # ---------------------------------------------------------------------
-        # Step 7: Verify we have a valid pose near the expected start
-        # ---------------------------------------------------------------------
-        pose = self.get_robot_pose_from_tf()
-        if pose:
-            x, y, yaw = pose
-            expected_x = self.robot_start['x']
-            expected_y = self.robot_start['y']
-            error = math.sqrt((x - expected_x)**2 + (y - expected_y)**2)
-            
-            if error > 1.0:  # More than 1 meter off
-                self.get_logger().warn(
-                    f'  ⚠ Pose error: {error:.2f}m - AMCL may not have converged!'
-                )
-                self.get_logger().warn(
-                    f'    Expected: ({expected_x:.2f}, {expected_y:.2f})'
-                )
-                self.get_logger().warn(
-                    f'    Got: ({x:.2f}, {y:.2f})'
-                )
-                self.get_logger().warn(
-                    '    TIP: Try running the controller again, or reset Gazebo'
-                )
-            else:
-                self.get_logger().info(
-                    f'  ✓ Pose verified: ({x:.2f}, {y:.2f}), error: {error:.2f}m'
-                )
-        else:
-            self.get_logger().warn('  ⚠ Could not verify pose from TF')
+        for _ in range(20):
+            rclpy.spin_once(self, timeout_sec=0.1)
         
-        self.localization_initialized = True
-        self.get_logger().info('  ✓ Localization reset complete')
+        self.get_logger().info('  ✓ Localization ready')
     
     
-    # =========================================================================
-    # POSE RETRIEVAL
-    # =========================================================================
-    
-    def get_robot_pose_from_tf(self):
-        """
-        Get robot pose from TF transform tree.
-        
-        This is MORE RELIABLE than the AMCL topic because:
-        - TF is updated continuously by AMCL
-        - AMCL topic only publishes when pose changes significantly
-        
-        The TF tree maintains transforms between coordinate frames:
-        - 'map' frame: Fixed world reference
-        - 'base_link' frame: Robot's body
-        
-        We look up the transform from map to base_link to get robot's
-        position in the world.
-        
-        Returns:
-            tuple: (x, y, yaw) in meters and radians, or None if not available
-        """
+    def get_pose_from_tf(self):
+        """Get robot pose from TF."""
         try:
-            # Look up transform from 'map' frame to 'base_link' (robot) frame
-            # This tells us where the robot is in the map
-            transform = self.tf_buffer.lookup_transform(
-                'map',           # Target frame (where we want the pose expressed)
-                'base_link',     # Source frame (the robot's body)
-                rclpy.time.Time(),  # Get latest available transform (time=0)
-                timeout=rclpy.duration.Duration(seconds=0.5)  # Wait up to 0.5s
-            )
+            t = self.tf_buffer.lookup_transform(
+                'map', 'base_link', rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0))
             
-            # Extract position from the transform
-            x = transform.transform.translation.x
-            y = transform.transform.translation.y
-            
-            # Extract yaw (rotation around Z axis) from quaternion
-            # Quaternions represent 3D rotations as (x, y, z, w)
-            # For 2D navigation, we only care about yaw (rotation in XY plane)
-            q = transform.transform.rotation
-            # Formula to extract yaw from quaternion:
-            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-            yaw = math.atan2(siny_cosp, cosy_cosp)
-            
+            x = t.transform.translation.x
+            y = t.transform.translation.y
+            q = t.transform.rotation
+            yaw = math.atan2(2.0*(q.w*q.z + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z))
             return (x, y, yaw)
-            
-        except (LookupException, ConnectivityException, ExtrapolationException) as e:
-            # These exceptions mean the transform isn't available
-            # LookupException: Frame doesn't exist
-            # ConnectivityException: No path between frames
-            # ExtrapolationException: Requested time is outside available data
-            self.get_logger().debug(f'TF lookup failed: {e}')
+        except:
             return None
     
     
     def get_current_pose(self):
-        """
-        Get current robot pose using multiple fallback methods.
+        """Get pose with fallbacks."""
+        pose = self.get_pose_from_tf()
+        if pose:
+            return pose
         
-        This is a robust method that tries multiple sources for the pose.
-        
-        Priority (best to worst):
-        1. TF transform - Most reliable, updated continuously
-        2. AMCL topic - Only updated on significant pose change
-        3. Last known pose - Stale but better than nothing
-        4. Starting position - Last resort fallback
-        
-        Returns:
-            tuple: (x, y, yaw) - always returns something
-        """
-        # Method 1: Try TF (best option)
-        tf_pose = self.get_robot_pose_from_tf()
-        if tf_pose is not None:
-            return tf_pose
-        
-        # Method 2: Use AMCL pose from topic
-        if self.robot_pose is not None:
+        if self.robot_pose:
             q = self.robot_pose.orientation
-            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-            yaw = math.atan2(siny_cosp, cosy_cosp)
+            yaw = math.atan2(2.0*(q.w*q.z + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z))
             return (self.robot_pose.position.x, self.robot_pose.position.y, yaw)
         
-        # Method 3: Use last known pose
-        if self.last_known_pose is not None:
-            q = self.last_known_pose.orientation
-            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-            yaw = math.atan2(siny_cosp, cosy_cosp)
-            return (self.last_known_pose.position.x, self.last_known_pose.position.y, yaw)
-        
-        # Method 4: Fallback to starting position
-        self.get_logger().warn('Using starting position as fallback')
         return (self.robot_start['x'], self.robot_start['y'], self.robot_start['yaw'])
     
     
-    def wait_for_valid_pose(self, timeout=5.0):
-        """
-        Wait until we have a valid robot pose.
-        
-        This is important because:
-        - TF data may not be immediately available at startup
-        - AMCL needs time to initialize
-        - We should not navigate until we know where we are
-        
-        Parameters:
-            timeout (float): Maximum time to wait in seconds
-            
-        Returns:
-            bool: True if pose obtained, False if timeout
-        """
-        self.get_logger().info('  Waiting for valid robot pose...')
-        start_time = time.time()
-        
-        while (time.time() - start_time) < timeout:
-            # Process callbacks to get fresh data
-            rclpy.spin_once(self, timeout_sec=0.1)
-            
-            # Try to get pose from TF
-            tf_pose = self.get_robot_pose_from_tf()
-            if tf_pose is not None:
-                self.get_logger().info(
-                    f'  ✓ Got pose from TF: ({tf_pose[0]:.2f}, {tf_pose[1]:.2f})'
-                )
+    def wait_for_pose(self, timeout=10.0):
+        """Wait for valid pose."""
+        start = time.time()
+        while (time.time() - start) < timeout:
+            rclpy.spin_once(self, timeout_sec=0.2)
+            if self.get_pose_from_tf() or self.robot_pose:
                 return True
-            
-            # Try AMCL topic as backup
-            if self.robot_pose is not None:
-                self.get_logger().info(
-                    f'  ✓ Got pose from AMCL: '
-                    f'({self.robot_pose.position.x:.2f}, {self.robot_pose.position.y:.2f})'
-                )
-                return True
-        
-        self.get_logger().warn('  ⚠ Timeout waiting for pose - using fallback')
         return False
     
     
     # =========================================================================
-    # COORDINATE TRANSFORMATION FUNCTIONS
+    # MAP FUNCTIONS
     # =========================================================================
     
-    def world_to_map(self, world_x, world_y):
-        """
-        Convert world coordinates (meters) to map pixel coordinates.
-        
-        The map is stored as a 2D grid of pixels. To look up a world position
-        in the map, we need to convert from meters to pixel indices.
-        
-        The conversion uses:
-        - Map origin: World position of pixel (0,0)
-        - Resolution: Meters per pixel
-        
-        Parameters:
-            world_x (float): X position in meters (map frame)
-            world_y (float): Y position in meters (map frame)
-            
-        Returns:
-            tuple: (map_x, map_y) pixel coordinates, or None if outside map
-        """
-        if self.map_info is None:
+    def world_to_map(self, wx, wy):
+        """Convert world coords to map pixels."""
+        if not self.map_info:
             return None
-        
-        # Get map parameters
-        origin_x = self.map_info.origin.position.x  # World X of pixel (0,0)
-        origin_y = self.map_info.origin.position.y  # World Y of pixel (0,0)
-        resolution = self.map_info.resolution       # Meters per pixel
-        
-        # Convert: subtract origin, divide by resolution
-        map_x = int((world_x - origin_x) / resolution)
-        map_y = int((world_y - origin_y) / resolution)
-        
-        # Check bounds
-        if 0 <= map_x < self.map_info.width and 0 <= map_y < self.map_info.height:
-            return (map_x, map_y)
-        else:
-            return None  # Outside map bounds
+        ox = self.map_info.origin.position.x
+        oy = self.map_info.origin.position.y
+        res = self.map_info.resolution
+        mx = int((wx - ox) / res)
+        my = int((wy - oy) / res)
+        if 0 <= mx < self.map_info.width and 0 <= my < self.map_info.height:
+            return (mx, my)
+        return None
     
     
-    def map_to_world(self, map_x, map_y):
-        """
-        Convert map pixel coordinates to world coordinates (meters).
-        
-        Inverse of world_to_map().
-        
-        Parameters:
-            map_x (int): Pixel X coordinate
-            map_y (int): Pixel Y coordinate
-            
-        Returns:
-            tuple: (world_x, world_y) in meters, or None if no map
-        """
-        if self.map_info is None:
-            return None
-        
-        origin_x = self.map_info.origin.position.x
-        origin_y = self.map_info.origin.position.y
-        resolution = self.map_info.resolution
-        
-        # Convert: multiply by resolution, add origin
-        # +0.5 to get center of pixel instead of corner
-        world_x = origin_x + (map_x + 0.5) * resolution
-        world_y = origin_y + (map_y + 0.5) * resolution
-        
-        return (world_x, world_y)
-    
-    
-    # =========================================================================
-    # MAP QUERY FUNCTIONS
-    # =========================================================================
-    
-    def is_occupied_in_map(self, world_x, world_y):
-        """
-        Check if a world position is marked as OCCUPIED in the static map.
-        
-        The map contains occupancy values:
-        - -1: Unknown (not seen by mapping)
-        - 0: Free space (definitely empty)
-        - 100: Occupied (definitely an obstacle)
-        - Values in between represent probability
-        
-        Parameters:
-            world_x (float): X position in meters
-            world_y (float): Y position in meters
-            
-        Returns:
-            bool: True if position is occupied in the static map
-        """
+    def is_occupied(self, wx, wy):
+        """Check if world position is occupied."""
         if self.map_data is None:
             return False
-        
-        map_coords = self.world_to_map(world_x, world_y)
-        if map_coords is None:
-            return False  # Outside map = not occupied
-        
-        map_x, map_y = map_coords
-        
-        # Note: numpy array is indexed as [row, col] = [y, x]
-        occupancy_value = self.map_data[map_y, map_x]
-        
-        # Compare to threshold (default 50)
-        threshold = self.detection_config['map_obstacle_threshold']
-        return occupancy_value > threshold
+        coords = self.world_to_map(wx, wy)
+        if coords is None:
+            return True  # Outside map = occupied
+        mx, my = coords
+        return self.map_data[my, mx] > self.detection_config['map_obstacle_threshold']
     
     
-    def is_near_static_obstacle(self, world_x, world_y):
+    def is_area_clear(self, wx, wy, radius=0.5):
         """
-        Check if a position is near a static obstacle in the map.
+        Check if an area around a point is clear of obstacles.
         
-        This checks the position AND surrounding area, providing a buffer
-        to account for:
-        - Map resolution (might miss thin obstacles)
-        - Laser accuracy
-        - Robot footprint
-        
-        Parameters:
-            world_x (float): X position in meters
-            world_y (float): Y position in meters
-            
-        Returns:
-            bool: True if near a static obstacle
+        This is KEY for finding good approach points!
         """
         if self.map_data is None:
-            return False
+            return True
         
-        buffer = self.detection_config['dynamic_object_buffer']
+        # Check grid of points
+        step = 0.15  # Check every 15cm
+        for dx in np.arange(-radius, radius + step, step):
+            for dy in np.arange(-radius, radius + step, step):
+                if dx*dx + dy*dy <= radius*radius:  # Circle check
+                    if self.is_occupied(wx + dx, wy + dy):
+                        return False
+        return True
+    
+    
+    def is_path_clear(self, x1, y1, x2, y2, step=0.2):
+        """
+        Check if straight line path between two points is clear.
         
-        # Check 3x3 grid of points around the position
-        for dx in [-buffer, 0, buffer]:
-            for dy in [-buffer, 0, buffer]:
-                if self.is_occupied_in_map(world_x + dx, world_y + dy):
+        This helps verify robot can actually reach the approach point.
+        """
+        if self.map_data is None:
+            return True
+        
+        dist = math.sqrt((x2-x1)**2 + (y2-y1)**2)
+        if dist < step:
+            return self.is_area_clear(x2, y2, 0.3)
+        
+        steps = int(dist / step) + 1
+        for i in range(steps + 1):
+            t = i / steps
+            x = x1 + t * (x2 - x1)
+            y = y1 + t * (y2 - y1)
+            if self.is_occupied(x, y):
+                return False
+        return True
+    
+    
+    def is_near_static_obstacle(self, wx, wy):
+        """Check if near static obstacle."""
+        buf = self.detection_config['dynamic_object_buffer']
+        for dx in [-buf, 0, buf]:
+            for dy in [-buf, 0, buf]:
+                if self.is_occupied(wx + dx, wy + dy):
                     return True
-        
         return False
     
     
     # =========================================================================
-    # HUMAN DETECTION FUNCTIONS
+    # SMART APPROACH POINT FINDER (THE KEY FIX!)
     # =========================================================================
     
-    def detect_humans_with_map(self):
+    def find_clear_approach_point(self, person_x, person_y):
         """
-        Main detection function: Find humans by comparing scan to map.
+        Find an approach point around the person that is in CLEAR SPACE.
         
-        ALGORITHM:
-        1. Get robot's current pose
-        2. Transform each laser point to world coordinates
-        3. Check if that point is in the static map (obstacle)
-        4. Points NOT in static map are "dynamic" = potential humans
-        5. Cluster nearby dynamic points
-        6. Analyze clusters for human-like shape (correct width)
+        This is the KEY FIX for the "going to wall/shelf" problem!
         
-        This distinguishes humans (dynamic) from walls/shelves (static).
+        Strategy:
+        1. Try multiple angles around the person
+        2. For each angle, check if that position is:
+           - Not occupied in the map
+           - Has clear area around it (robot footprint)
+           - Has relatively clear path from current position
+        3. Return the first valid point found
         
         Returns:
-            list: List of detected humans, each dict with x, y, width, etc.
+            tuple: (x, y, yaw) for approach point, or None
         """
-        if self.latest_scan is None:
-            self.get_logger().warn('No laser scan data available')
-            return []
+        robot_x, robot_y, _ = self.get_current_pose()
         
-        if self.map_data is None:
-            self.get_logger().warn('No map data available - using basic detection')
-            return self.detect_humans_basic()
+        approach_dist = self.detection_config['approach_distance']
+        min_dist = self.detection_config['min_approach_distance']
+        angles_deg = self.detection_config['approach_angles_deg']
         
-        # GET POSE USING ROBUST METHOD
-        pose = self.get_current_pose()
-        robot_x, robot_y, robot_yaw = pose
+        self.get_logger().info(f'  Finding clear approach to ({person_x}, {person_y})...')
         
-        self.get_logger().info(
-            f'  Robot pose: ({robot_x:.2f}, {robot_y:.2f}, '
-            f'yaw={math.degrees(robot_yaw):.1f}°)'
-        )
-        
-        scan = self.latest_scan
-        ranges = np.array(scan.ranges)
-        
-        # Get configuration parameters
-        range_min = self.detection_config['scan_range_min']
-        range_max = self.detection_config['scan_range_max']
-        gap_threshold = self.detection_config['cluster_gap_threshold']
-        min_points = self.detection_config['min_cluster_points']
-        
-        # =====================================================================
-        # STEP 1: Find dynamic points (in scan but NOT in static map)
-        # =====================================================================
-        
-        dynamic_points = []
-        
-        for i, distance in enumerate(ranges):
-            # Skip invalid readings
-            if not np.isfinite(distance):
-                continue
-            if distance < range_min or distance > range_max:
-                continue
+        # Try each angle
+        for angle_deg in angles_deg:
+            angle_rad = math.radians(angle_deg)
             
-            # Calculate world position of this laser hit
-            # laser_angle: angle relative to robot's forward direction
-            laser_angle = scan.angle_min + i * scan.angle_increment
-            # world_angle: angle in world frame (add robot's yaw)
-            world_angle = robot_yaw + laser_angle
-            
-            # Convert polar (distance, angle) to Cartesian (x, y)
-            hit_x = robot_x + distance * math.cos(world_angle)
-            hit_y = robot_y + distance * math.sin(world_angle)
-            
-            # Check if this point is a STATIC obstacle (in the map)
-            is_static = self.is_near_static_obstacle(hit_x, hit_y)
-            
-            # If NOT static, it's a dynamic object (potential human!)
-            if not is_static:
-                dynamic_points.append({
-                    'x': hit_x,
-                    'y': hit_y,
-                    'distance': distance,
-                    'angle': laser_angle,
-                    'index': i  # Keep track of scan index for clustering
-                })
-        
-        self.get_logger().info(
-            f'  Found {len(dynamic_points)} dynamic points (not in map)'
-        )
-        
-        # =====================================================================
-        # STEP 2: Cluster dynamic points into objects
-        # =====================================================================
-        # Consecutive laser indices hitting the same object should cluster
-        
-        if len(dynamic_points) < min_points:
-            return []
-        
-        # Sort by scan index
-        dynamic_points.sort(key=lambda p: p['index'])
-        
-        # Group points with consecutive indices
-        clusters = []
-        current_cluster = [dynamic_points[0]]
-        
-        for i in range(1, len(dynamic_points)):
-            prev_idx = dynamic_points[i - 1]['index']
-            curr_idx = dynamic_points[i]['index']
-            
-            # If indices are close, same cluster
-            if curr_idx - prev_idx <= gap_threshold:
-                current_cluster.append(dynamic_points[i])
-            else:
-                # Gap too large - save current cluster, start new one
-                if len(current_cluster) >= min_points:
-                    clusters.append(current_cluster)
-                current_cluster = [dynamic_points[i]]
-        
-        # Don't forget the last cluster!
-        if len(current_cluster) >= min_points:
-            clusters.append(current_cluster)
-        
-        self.get_logger().info(f'  Formed {len(clusters)} clusters')
-        
-        # =====================================================================
-        # STEP 3: Analyze clusters to identify human-shaped objects
-        # =====================================================================
-        
-        humans = []
-        
-        for cluster in clusters:
-            human = self.analyze_cluster_for_human(cluster)
-            if human:
-                humans.append(human)
-        
-        return humans
-    
-    
-    def analyze_cluster_for_human(self, cluster):
-        """
-        Analyze a cluster of points to determine if it's human-shaped.
-        
-        Humans typically appear as:
-        - A cluster of 3-100 points (depending on distance)
-        - Width between 0.1m and 1.2m (shoulder width to extended arms)
-        
-        Parameters:
-            cluster (list): List of point dicts with x, y, distance, etc.
-            
-        Returns:
-            dict: Human detection info, or None if not human-shaped
-        """
-        min_points = self.detection_config['min_cluster_points']
-        max_points = self.detection_config['max_cluster_points']
-        min_width = self.detection_config['human_width_min']
-        max_width = self.detection_config['human_width_max']
-        
-        # Check point count
-        if len(cluster) < min_points:
-            return None
-        if len(cluster) > max_points:
-            self.get_logger().debug(
-                f'  Cluster too large: {len(cluster)} points (max {max_points})'
-            )
-            return None
-        
-        # Extract coordinates
-        x_coords = [p['x'] for p in cluster]
-        y_coords = [p['y'] for p in cluster]
-        distances = [p['distance'] for p in cluster]
-        
-        # Calculate cluster center and dimensions
-        center_x = np.mean(x_coords)
-        center_y = np.mean(y_coords)
-        avg_distance = np.mean(distances)
-        
-        # Calculate width (diagonal of bounding box)
-        width_x = max(x_coords) - min(x_coords)
-        width_y = max(y_coords) - min(y_coords)
-        width = math.sqrt(width_x**2 + width_y**2)
-        
-        # Check if width is human-like
-        if min_width < width < max_width:
-            self.get_logger().info(
-                f'  → HUMAN DETECTED: pos=({center_x:.2f}, {center_y:.2f}), '
-                f'width={width:.2f}m, dist={avg_distance:.2f}m, '
-                f'points={len(cluster)} ✓'
-            )
-            
-            return {
-                'x': center_x,
-                'y': center_y,
-                'width': width,
-                'distance': avg_distance,
-                'num_points': len(cluster)
-            }
-        else:
-            self.get_logger().debug(
-                f'  → Object width={width:.2f}m not in range '
-                f'[{min_width}, {max_width}]'
-            )
-            return None
-    
-    
-    def detect_humans_basic(self):
-        """
-        Fallback detection without map comparison.
-        
-        Used when map data isn't available. Less reliable because
-        it can't distinguish humans from walls - just looks for
-        human-sized clusters of points.
-        
-        Returns:
-            list: List of potential human detections
-        """
-        if self.latest_scan is None:
-            return []
-        
-        scan = self.latest_scan
-        ranges = np.array(scan.ranges)
-        
-        # Replace inf/nan with max range
-        ranges = np.where(np.isinf(ranges), scan.range_max, ranges)
-        ranges = np.where(np.isnan(ranges), scan.range_max, ranges)
-        
-        # Get config
-        range_min = self.detection_config['scan_range_min']
-        range_max = self.detection_config['scan_range_max']
-        min_width = self.detection_config['human_width_min']
-        max_width = self.detection_config['human_width_max']
-        min_points = self.detection_config['min_cluster_points']
-        max_points = self.detection_config['max_cluster_points']
-        gap_threshold = self.detection_config['cluster_gap_threshold']
-        
-        # Find points in valid range
-        in_range = (ranges > range_min) & (ranges < range_max)
-        indices = np.where(in_range)[0]
-        
-        if len(indices) < min_points:
-            return []
-        
-        # Cluster consecutive indices
-        clusters = []
-        current = [indices[0]]
-        
-        for i in range(1, len(indices)):
-            if indices[i] - indices[i-1] <= gap_threshold:
-                current.append(indices[i])
-            else:
-                if len(current) >= min_points:
-                    clusters.append(current)
-                current = [indices[i]]
-        
-        if len(current) >= min_points:
-            clusters.append(current)
-        
-        # Analyze clusters
-        humans = []
-        
-        for cluster in clusters:
-            if len(cluster) > max_points:
-                continue
-            
-            # Calculate angular width
-            start_angle = scan.angle_min + cluster[0] * scan.angle_increment
-            end_angle = scan.angle_min + cluster[-1] * scan.angle_increment
-            avg_dist = np.mean(ranges[cluster])
-            
-            # Arc length = radius * angle
-            width = avg_dist * abs(end_angle - start_angle)
-            
-            if min_width < width < max_width:
-                center_idx = cluster[len(cluster) // 2]
-                center_angle = scan.angle_min + center_idx * scan.angle_increment
+            # Try different distances (start far, move closer if blocked)
+            for dist in [approach_dist, min_dist + 0.5, min_dist]:
+                # Calculate candidate point
+                cand_x = person_x + dist * math.cos(angle_rad)
+                cand_y = person_y + dist * math.sin(angle_rad)
                 
-                humans.append({
-                    'x': avg_dist * math.cos(center_angle),  # Relative to robot
-                    'y': avg_dist * math.sin(center_angle),
-                    'width': width,
-                    'distance': avg_dist,
-                    'num_points': len(cluster)
-                })
+                # Check 1: Is the point itself clear?
+                if not self.is_area_clear(cand_x, cand_y, radius=0.4):
+                    self.get_logger().debug(
+                        f'    {angle_deg}° @ {dist}m: Point blocked')
+                    continue
+                
+                # Check 2: Is there a reasonably clear path?
+                # (Nav2 will do proper planning, this is just a quick check)
+                if not self.is_path_clear(robot_x, robot_y, cand_x, cand_y, step=0.5):
+                    self.get_logger().debug(
+                        f'    {angle_deg}° @ {dist}m: Path blocked')
+                    continue
+                
+                # Found a valid point!
+                # Calculate yaw to face the person
+                face_yaw = math.atan2(person_y - cand_y, person_x - cand_x)
+                
+                self.get_logger().info(
+                    f'  ✓ Found clear approach: ({cand_x:.2f}, {cand_y:.2f})')
+                self.get_logger().info(
+                    f'    Angle: {angle_deg}°, Distance: {dist}m')
+                
+                return (cand_x, cand_y, face_yaw)
+        
+        # No clear point found - return a fallback
+        self.get_logger().warn('  ⚠ No clear approach found, using fallback')
+        
+        # Fallback: try to get as close as possible from robot's direction
+        dx = robot_x - person_x
+        dy = robot_y - person_y
+        d = math.sqrt(dx*dx + dy*dy)
+        if d > 0:
+            dx, dy = dx/d, dy/d
+        
+        fall_x = person_x + dx * approach_dist
+        fall_y = person_y + dy * approach_dist
+        fall_yaw = math.atan2(-dy, -dx)
+        
+        return (fall_x, fall_y, fall_yaw)
+    
+    
+    # =========================================================================
+    # HUMAN DETECTION
+    # =========================================================================
+    
+    def detect_humans(self):
+        """Detect humans by finding dynamic objects."""
+        if not self.latest_scan or self.map_data is None:
+            return []
+        
+        robot_x, robot_y, robot_yaw = self.get_current_pose()
+        scan = self.latest_scan
+        ranges = np.array(scan.ranges)
+        
+        cfg = self.detection_config
+        
+        # Find dynamic points
+        dynamic = []
+        for i, dist in enumerate(ranges):
+            if not np.isfinite(dist):
+                continue
+            if dist < cfg['scan_range_min'] or dist > cfg['scan_range_max']:
+                continue
+            
+            angle = scan.angle_min + i * scan.angle_increment
+            world_angle = robot_yaw + angle
+            
+            hx = robot_x + dist * math.cos(world_angle)
+            hy = robot_y + dist * math.sin(world_angle)
+            
+            if not self.is_near_static_obstacle(hx, hy):
+                dynamic.append({'x': hx, 'y': hy, 'dist': dist, 'idx': i})
+        
+        if len(dynamic) < cfg['min_cluster_points']:
+            return []
+        
+        # Cluster
+        dynamic.sort(key=lambda p: p['idx'])
+        clusters = []
+        curr = [dynamic[0]]
+        
+        for i in range(1, len(dynamic)):
+            if dynamic[i]['idx'] - dynamic[i-1]['idx'] <= cfg['cluster_gap_threshold']:
+                curr.append(dynamic[i])
+            else:
+                if len(curr) >= cfg['min_cluster_points']:
+                    clusters.append(curr)
+                curr = [dynamic[i]]
+        if len(curr) >= cfg['min_cluster_points']:
+            clusters.append(curr)
+        
+        # Analyze
+        humans = []
+        for cluster in clusters:
+            if len(cluster) > cfg['max_cluster_points']:
+                continue
+            
+            xs = [p['x'] for p in cluster]
+            ys = [p['y'] for p in cluster]
+            
+            cx, cy = np.mean(xs), np.mean(ys)
+            width = math.sqrt((max(xs)-min(xs))**2 + (max(ys)-min(ys))**2)
+            
+            if cfg['human_width_min'] < width < cfg['human_width_max']:
+                self.get_logger().info(
+                    f'  → HUMAN: ({cx:.2f}, {cy:.2f}), w={width:.2f}m ✓')
+                humans.append({'x': cx, 'y': cy, 'width': width})
         
         return humans
     
     
-    def check_for_human_with_confidence(self):
-        """
-        Take multiple scans and use majority voting for reliable detection.
+    def check_for_human_confident(self):
+        """Multiple scan check."""
+        num = self.detection_config['num_scans_to_check']
+        thresh = self.detection_config['detection_threshold']
         
-        Single scans can give false positives/negatives. By taking multiple
-        scans and requiring a majority to detect something, we get more
-        reliable results.
-        
-        Returns:
-            bool: True if human confidently detected
-        """
-        num_scans = self.detection_config['num_scans_to_check']
-        threshold = self.detection_config['detection_threshold']
-        
-        # Wait for valid pose first
-        self.wait_for_valid_pose(timeout=3.0)
-        
-        detection_count = 0
-        
-        for i in range(num_scans):
-            # Give time for fresh scan data
-            # Spin multiple times to ensure we get new laser data
+        count = 0
+        for i in range(num):
             for _ in range(3):
                 rclpy.spin_once(self, timeout_sec=0.1)
-            time.sleep(0.2)  # Wait for scan to update
+            time.sleep(0.2)
             
-            humans = self.detect_humans_with_map()
-            
-            if len(humans) > 0:
-                detection_count += 1
-                self.get_logger().info(
-                    f'  Scan {i+1}/{num_scans}: {len(humans)} human(s) detected ✓'
-                )
+            if len(self.detect_humans()) > 0:
+                count += 1
+                self.get_logger().info(f'  Scan {i+1}/{num}: Detected ✓')
             else:
-                self.get_logger().info(
-                    f'  Scan {i+1}/{num_scans}: No humans detected'
-                )
+                self.get_logger().info(f'  Scan {i+1}/{num}: None')
         
-        # Check if we met the threshold
-        confident = detection_count >= threshold
+        result = count >= thresh
         self.get_logger().info(
-            f'  Detection result: {detection_count}/{num_scans} positive '
-            f'(threshold: {threshold}) → {"CONFIRMED ✓" if confident else "NOT CONFIRMED"}'
-        )
-        
-        return confident
+            f'  Result: {count}/{num} → {"CONFIRMED ✓" if result else "NOT FOUND"}')
+        return result
     
     
     # =========================================================================
-    # NAVIGATION FUNCTIONS
+    # NAVIGATION
     # =========================================================================
     
     def create_pose_stamped(self, x, y, yaw):
-        """
-        Create a PoseStamped message for navigation goals.
-        
-        PoseStamped is the standard ROS2 message for specifying a position
-        and orientation in a particular coordinate frame.
-        
-        Parameters:
-            x (float): X position in meters
-            y (float): Y position in meters
-            yaw (float): Orientation in radians (0 = facing +X, π/2 = facing +Y)
-            
-        Returns:
-            PoseStamped: The goal pose message
-        """
+        """Create goal pose."""
         pose = PoseStamped()
-        
-        # Header specifies the coordinate frame and timestamp
-        pose.header.frame_id = 'map'  # Goal is in map frame
+        pose.header.frame_id = 'map'
         pose.header.stamp = self.navigator.get_clock().now().to_msg()
-        
-        # Position (in meters)
         pose.pose.position.x = float(x)
         pose.pose.position.y = float(y)
-        pose.pose.position.z = 0.0  # Ground level
-        
-        # Orientation as quaternion
-        # For 2D navigation, we only set Z and W components
-        # This represents rotation around the Z axis (yaw)
-        pose.pose.orientation.x = 0.0
-        pose.pose.orientation.y = 0.0
-        pose.pose.orientation.z = math.sin(yaw / 2.0)  # Quaternion formula
+        pose.pose.orientation.z = math.sin(yaw / 2.0)
         pose.pose.orientation.w = math.cos(yaw / 2.0)
-        
         return pose
     
     
     def navigate_to(self, x, y, yaw=0.0):
-        """
-        Navigate to a position and wait for completion.
-        
-        Uses Nav2's BasicNavigator to plan and execute a path to the goal.
-        Blocks until navigation completes or fails.
-        
-        Parameters:
-            x (float): Goal X position in meters
-            y (float): Goal Y position in meters
-            yaw (float): Goal orientation in radians
-            
-        Returns:
-            bool: True if navigation succeeded, False otherwise
-        """
-        goal = self.create_pose_stamped(x, y, yaw)
+        """Navigate to position."""
+        if self.shutting_down:
+            return False
         
         self.get_logger().info(f'  Navigating to ({x:.2f}, {y:.2f})...')
+        self.navigator.goToPose(self.create_pose_stamped(x, y, yaw))
         
-        # Send goal to Nav2
-        self.navigator.goToPose(goal)
-        
-        # Wait for completion, processing callbacks meanwhile
         while not self.navigator.isTaskComplete():
+            if self.shutting_down:
+                self.navigator.cancelTask()
+                return False
             rclpy.spin_once(self, timeout_sec=0.1)
         
-        # Check result
         result = self.navigator.getResult()
-        
         if result == TaskResult.SUCCEEDED:
-            self.get_logger().info('  ✓ Navigation succeeded')
-            # Wait a moment for pose to update
+            self.get_logger().info('  ✓ Arrived')
             time.sleep(0.5)
             for _ in range(10):
                 rclpy.spin_once(self, timeout_sec=0.1)
             return True
         else:
-            self.get_logger().warn(f'  ✗ Navigation failed: {result}')
+            self.get_logger().warn(f'  ✗ Nav failed: {result}')
             return False
     
     
-    def check_person_at_location(self, person_x, person_y, person_name):
-        """
-        Navigate near a person's expected location and scan for them.
+    def check_person_at_location(self, person_x, person_y, name):
+        """Check for person using SMART approach."""
+        self.get_logger().info(f'\n  Checking for {name}')
+        self.get_logger().info(f'  Expected: ({person_x}, {person_y})')
         
-        FIXED VERSION: Now approaches from the robot's side of the person,
-        not through walls!
+        # Find clear approach point (THE FIX!)
+        approach = self.find_clear_approach_point(person_x, person_y)
+        if not approach:
+            self.get_logger().error('  No approach point found!')
+            return False
         
-        OLD BUGGY BEHAVIOR:
-        - Calculated approach point BEHIND the person (opposite side from robot)
-        - Often placed the approach point inside walls or obstacles
+        obs_x, obs_y, obs_yaw = approach
         
-        NEW CORRECT BEHAVIOR:
-        - Calculates approach point BETWEEN robot and person
-        - Stays on the navigable side (where robot came from)
-        
-        Parameters:
-            person_x (float): Expected X position of person
-            person_y (float): Expected Y position of person
-            person_name (str): Human-readable name for logging
-            
-        Returns:
-            bool: True if person was detected at this location
-        """
-        self.get_logger().info(f'\n  Checking for {person_name}')
-        self.get_logger().info(f'  Expected position: ({person_x}, {person_y})')
-        
-        # Get current robot position using our robust method
-        robot_x, robot_y, _ = self.get_current_pose()
-        
-        # =====================================================================
-        # FIX: Calculate direction FROM person TO robot
-        # =====================================================================
-        # This ensures we approach from the side where the robot already is
-        # (which is presumably navigable open space, not a wall)
-        #
-        # OLD (BUGGY):
-        #   dx = person_x - robot_x  (vector from robot to person)
-        #   obs_x = person_x - dx * approach_dist  (goes BEHIND person!)
-        #
-        # NEW (FIXED):
-        #   dx = robot_x - person_x  (vector from person to robot)
-        #   obs_x = person_x + dx * approach_dist  (stays on robot's side!)
-        
-        dx = robot_x - person_x      # Vector pointing FROM person TOWARD robot
-        dy = robot_y - person_y
-        dist = math.sqrt(dx*dx + dy*dy)  # Distance between robot and person
-        
-        # Normalize to unit vector (length = 1)
-        if dist > 0:
-            dx /= dist  # Now dx is between -1 and 1
-            dy /= dist  # Now dy is between -1 and 1
-        else:
-            # Edge case: robot is already at person location
-            dx, dy = 1.0, 0.0  # Default: offset in +X direction
-        
-        # Calculate observation point:
-        # Start at person, move toward where robot currently is
-        approach_dist = self.detection_config['approach_distance']  # 2.0 meters
-        obs_x = person_x + dx * approach_dist  # 2m away from person, toward robot
-        obs_y = person_y + dy * approach_dist
-        
-        # Calculate yaw to face the person (opposite of approach direction)
-        # We negate dx, dy because we want to LOOK AT the person, not away
-        obs_yaw = math.atan2(-dy, -dx)
-        
-        self.get_logger().info(f'  Observation point: ({obs_x:.2f}, {obs_y:.2f})')
-        self.get_logger().info(
-            f'  (Approaching from robot side, facing person at yaw={math.degrees(obs_yaw):.1f}°)'
-        )
-        
-        # Navigate to observation point
+        # Navigate
         if not self.navigate_to(obs_x, obs_y, obs_yaw):
-            return False
+            self.get_logger().warn('  Nav failed, scanning anyway...')
         
-        # Wait for pose to stabilize after navigation
-        self.get_logger().info('  Waiting for pose to stabilize...')
+        # Stabilize
         time.sleep(1.0)
         for _ in range(20):
             rclpy.spin_once(self, timeout_sec=0.1)
         
-        # Perform human detection scan
-        self.get_logger().info('  Scanning for human...')
-        found = self.check_for_human_with_confidence()
+        # Scan
+        self.get_logger().info('  Scanning...')
+        found = self.check_for_human_confident()
         
         if found:
-            self.get_logger().info(f'  ✓ {person_name} FOUND at expected location!')
+            self.get_logger().info(f'  ✓ {name} FOUND!')
         else:
-            self.get_logger().warn(f'  ✗ {person_name} NOT at expected location')
+            self.get_logger().warn(f'  ✗ {name} not found')
         
         return found
     
     
     # =========================================================================
-    # MISSION CONTROL
+    # MISSION
     # =========================================================================
     
     def start_mission_once(self):
-        """
-        Ensure mission only starts once.
-        
-        This is called by a timer, but we only want to run the mission
-        once (not repeatedly every 5 seconds).
-        """
-        if self.mission_started:
+        if self.mission_started or self.shutting_down:
             return
         self.mission_started = True
         self.run_mission()
     
     
     def run_mission(self):
-        """
-        Main mission sequence.
-        
-        This is the high-level control flow:
-        1. Initialize Nav2
-        2. Reset localization (CRITICAL for re-runs!)
-        3. Wait for map data
-        4. Check expected person locations
-        5. Search warehouse if people are missing
-        6. Report results
-        """
-        self.get_logger().info('')
-        self.get_logger().info('=' * 60)
-        self.get_logger().info('  STARTING HUMAN DETECTION MISSION')
+        """Main mission."""
+        self.get_logger().info('\n' + '=' * 60)
+        self.get_logger().info('  STARTING MISSION')
         self.get_logger().info('=' * 60)
         
-        # =====================================================================
-        # Step 1: Wait for Nav2 to be active
-        # =====================================================================
-        self.get_logger().info('\n[Step 1] Waiting for Nav2...')
+        # Setup
+        self.get_logger().info('\n[1] Waiting for Nav2...')
         self.navigator.waitUntilNav2Active()
-        self.get_logger().info('  ✓ Nav2 is active')
+        self.get_logger().info('  ✓ Nav2 ready')
         
-        # =====================================================================
-        # Step 2: Reset localization (THE FIX FOR RE-RUN ISSUES!)
-        # =====================================================================
-        self.get_logger().info('\n[Step 2] Resetting localization...')
+        self.get_logger().info('\n[2] Resetting localization...')
         self.reset_localization()
         
-        # =====================================================================
-        # Step 3: Wait for map data
-        # =====================================================================
-        self.get_logger().info('\n[Step 3] Waiting for map data...')
-        timeout = 10.0
-        start_time = time.time()
-        
-        while not self.map_received and (time.time() - start_time) < timeout:
-            rclpy.spin_once(self, timeout_sec=0.5)
-        
-        if self.map_received:
-            self.get_logger().info('  ✓ Map received')
-        else:
-            self.get_logger().warn('  ⚠ Map not received - using basic detection')
-        
-        # =====================================================================
-        # Step 4: Final verification before starting mission
-        # =====================================================================
-        self.get_logger().info('\n[Step 4] Final pose verification...')
-        if not self.wait_for_valid_pose(timeout=5.0):
-            self.get_logger().error('  ✗ Could not get valid pose! Continuing anyway...')
-        
-        pose = self.get_current_pose()
-        self.get_logger().info(f'  ✓ Starting from: ({pose[0]:.2f}, {pose[1]:.2f})')
-        
-        # =====================================================================
-        # Step 5: Check Person 1
-        # =====================================================================
-        self.get_logger().info('\n' + '=' * 60)
-        self.get_logger().info('[Step 5] CHECKING PERSON 1')
-        self.get_logger().info('=' * 60)
-        
-        self.person1_found = self.check_person_at_location(
-            self.person1_expected['x'],
-            self.person1_expected['y'],
-            self.person1_expected['name']
-        )
-        
-        # =====================================================================
-        # Step 6: Check Person 2
-        # =====================================================================
-        self.get_logger().info('\n' + '=' * 60)
-        self.get_logger().info('[Step 6] CHECKING PERSON 2')
-        self.get_logger().info('=' * 60)
-        
-        self.person2_found = self.check_person_at_location(
-            self.person2_expected['x'],
-            self.person2_expected['y'],
-            self.person2_expected['name']
-        )
-        
-        # =====================================================================
-        # Step 7: Report initial findings
-        # =====================================================================
-        self.print_initial_report()
-        
-        # =====================================================================
-        # Step 8: Search if needed
-        # =====================================================================
-        if not self.person1_found or not self.person2_found:
-            self.get_logger().info('\n' + '=' * 60)
-            self.get_logger().info('[Step 7] SEARCHING FOR MISSING PERSON(S)')
-            self.get_logger().info('=' * 60)
-            self.search_warehouse()
-        
-        # =====================================================================
-        # Step 9: Final report
-        # =====================================================================
-        self.print_final_report()
-    
-    
-    def search_warehouse(self):
-        """
-        Search predefined waypoints for missing people.
-        
-        If people weren't found at their expected locations, we search
-        the warehouse by visiting waypoints and scanning for humans.
-        """
-        missing = []
-        if not self.person1_found:
-            missing.append('Person 1')
-        if not self.person2_found:
-            missing.append('Person 2')
-        
-        self.get_logger().info(f'  Missing: {", ".join(missing)}')
-        self.get_logger().info(
-            f'  Searching {len(self.search_waypoints)} waypoints...'
-        )
-        
-        for i, wp in enumerate(self.search_waypoints):
-            # Stop if we've found everyone
-            if self.person1_found and self.person2_found:
-                self.get_logger().info('  All persons found! Ending search.')
-                break
-            
-            self.get_logger().info(
-                f'\n  Waypoint {i+1}/{len(self.search_waypoints)}: '
-                f'({wp["x"]}, {wp["y"]})'
-            )
-            
-            if not self.navigate_to(wp['x'], wp['y'], 0.0):
-                self.get_logger().warn('  Could not reach waypoint, skipping...')
-                continue
-            
-            # Wait for stable pose
-            time.sleep(0.5)
-            for _ in range(10):
+        self.get_logger().info('\n[3] Checking map...')
+        if not self.map_received:
+            for _ in range(50):
                 rclpy.spin_once(self, timeout_sec=0.1)
-            
-            # Scan for humans
-            humans = self.detect_humans_with_map()
-            
-            if len(humans) > 0:
-                self.get_logger().info(f'  🔍 Found {len(humans)} person(s) here!')
-                
-                # Record the location
-                if not self.person1_found and self.person1_new_location is None:
-                    self.person1_new_location = {'x': wp['x'], 'y': wp['y']}
-                    self.get_logger().info('  → Recorded as Person 1 new location')
-                elif not self.person2_found and self.person2_new_location is None:
-                    self.person2_new_location = {'x': wp['x'], 'y': wp['y']}
-                    self.get_logger().info('  → Recorded as Person 2 new location')
-    
-    
-    def print_initial_report(self):
-        """Print results after checking expected locations."""
-        self.get_logger().info('\n' + '=' * 60)
-        self.get_logger().info('  INITIAL CHECK RESULTS')
-        self.get_logger().info('=' * 60)
+        self.get_logger().info(f'  Map: {"✓ Ready" if self.map_received else "⚠ Not available"}')
         
-        if self.person1_found:
-            self.get_logger().info(
-                f'  ✓ Person 1: FOUND at '
-                f'({self.person1_expected["x"]}, {self.person1_expected["y"]})'
-            )
-        else:
-            self.get_logger().warn(
-                f'  ✗ Person 1: NOT at '
-                f'({self.person1_expected["x"]}, {self.person1_expected["y"]})'
+        self.get_logger().info('\n[4] Verifying pose...')
+        self.wait_for_pose(timeout=10.0)
+        pose = self.get_current_pose()
+        self.get_logger().info(f'  Position: ({pose[0]:.2f}, {pose[1]:.2f})')
+        
+        # Check persons
+        if not self.shutting_down:
+            self.get_logger().info('\n' + '=' * 60)
+            self.get_logger().info('[5] CHECKING PERSON 1')
+            self.get_logger().info('=' * 60)
+            self.person1_found = self.check_person_at_location(
+                self.person1_expected['x'],
+                self.person1_expected['y'],
+                self.person1_expected['name']
             )
         
-        if self.person2_found:
-            self.get_logger().info(
-                f'  ✓ Person 2: FOUND at '
-                f'({self.person2_expected["x"]}, {self.person2_expected["y"]})'
+        if not self.shutting_down:
+            self.get_logger().info('\n' + '=' * 60)
+            self.get_logger().info('[6] CHECKING PERSON 2')
+            self.get_logger().info('=' * 60)
+            self.person2_found = self.check_person_at_location(
+                self.person2_expected['x'],
+                self.person2_expected['y'],
+                self.person2_expected['name']
             )
-        else:
-            self.get_logger().warn(
-                f'  ✗ Person 2: NOT at '
-                f'({self.person2_expected["x"]}, {self.person2_expected["y"]})'
-            )
+        
+        # Report
+        self.print_report()
     
     
-    def print_final_report(self):
-        """Print final mission results."""
+    def print_report(self):
+        """Print results."""
         self.get_logger().info('\n')
-        self.get_logger().info('╔' + '═' * 58 + '╗')
-        self.get_logger().info('║' + '  FINAL MISSION REPORT'.center(58) + '║')
-        self.get_logger().info('╠' + '═' * 58 + '╣')
+        self.get_logger().info('╔' + '═' * 50 + '╗')
+        self.get_logger().info('║' + '  FINAL REPORT'.center(50) + '║')
+        self.get_logger().info('╠' + '═' * 50 + '╣')
         
-        # Person 1 status
-        if self.person1_found:
-            msg = (f'✓ Person 1: Original location '
-                   f'({self.person1_expected["x"]}, {self.person1_expected["y"]})')
-        elif self.person1_new_location:
-            msg = (f'→ Person 1: MOVED to '
-                   f'({self.person1_new_location["x"]}, {self.person1_new_location["y"]})')
-        else:
-            msg = '? Person 1: MOVED - new location unknown'
-        self.get_logger().info('║  ' + msg.ljust(56) + '║')
+        p1 = '✓ FOUND' if self.person1_found else '✗ NOT FOUND'
+        p2 = '✓ FOUND' if self.person2_found else '✗ NOT FOUND'
         
-        # Person 2 status
-        if self.person2_found:
-            msg = (f'✓ Person 2: Original location '
-                   f'({self.person2_expected["x"]}, {self.person2_expected["y"]})')
-        elif self.person2_new_location:
-            msg = (f'→ Person 2: MOVED to '
-                   f'({self.person2_new_location["x"]}, {self.person2_new_location["y"]})')
-        else:
-            msg = '? Person 2: MOVED - new location unknown'
-        self.get_logger().info('║  ' + msg.ljust(56) + '║')
-        
-        self.get_logger().info('╚' + '═' * 58 + '╝')
-        self.get_logger().info('')
+        self.get_logger().info('║  ' + f'Person 1: {p1}'.ljust(48) + '║')
+        self.get_logger().info('║  ' + f'Person 2: {p2}'.ljust(48) + '║')
+        self.get_logger().info('╚' + '═' * 50 + '╝')
+    
+    
+    def shutdown(self):
+        self.shutting_down = True
 
-
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
 
 def main(args=None):
-    """
-    Main function - entry point for the node.
-    
-    This is called when you run the script or use 'ros2 run'.
-    """
-    # Initialize the ROS2 Python client library
-    # This must be called before creating any nodes
     rclpy.init(args=args)
-    
-    # Create an instance of our controller node
-    controller = MapAwareWarehouseController()
+    controller = WarehouseController()
     
     try:
-        # Spin the node - this keeps it running and processing callbacks
-        # spin() blocks until the node is shut down
         rclpy.spin(controller)
     except KeyboardInterrupt:
-        # Handle Ctrl+C gracefully
-        controller.get_logger().info('Shutting down...')
+        pass
     finally:
-        # Clean up
-        controller.navigator.lifecycleShutdown()  # Properly shut down Nav2
-        controller.destroy_node()                  # Destroy the node
-        rclpy.shutdown()                          # Shut down ROS2
+        controller.shutdown()
+        try:
+            controller.destroy_node()
+        except:
+            pass
+        try:
+            rclpy.shutdown()
+        except:
+            pass
 
 
-# This runs only if the script is executed directly (not imported)
 if __name__ == '__main__':
     main()

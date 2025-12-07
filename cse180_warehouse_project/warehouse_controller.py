@@ -1,11 +1,12 @@
 """
 ===============================================================================
-WAREHOUSE CONTROLLER - BALANCED TUNING
+WAREHOUSE CONTROLLER - SMART CLUSTERING
 ===============================================================================
 Fixes:
-1. RELAXED TOLERANCE: Reduced SEARCH_TOLERANCE from 8 -> 4.
-   (Prevents deleting people who are standing close to walls).
-2. RADIUS: Increased back to 1.5m to be more forgiving.
+1. CLUSTERING: Now groups points into separate clusters based on distance gaps.
+   This separates a person from the wall behind them.
+2. LOGIC: Checks each cluster individually. If ANY cluster is person-sized 
+   and near the target, it counts as a detection.
 """
 
 import rclpy
@@ -30,18 +31,19 @@ STATE_FILE = '/tmp/warehouse_controller_state.json'
 
 # --- TARGETS ---
 PERSON1_EXPECTED = {'x': 1.00, 'y': -1.00, 'name': 'Person 1'}
-PERSON1_SAFE_SPOT = {'x': -1.00, 'y': 1.00, 'yaw': -0.785} # Facing SE
+PERSON1_SAFE_SPOT = {'x': -1.00, 'y': 1.00, 'yaw': -0.785} 
 
 PERSON2_EXPECTED = {'x': -12.00, 'y': 15.00, 'name': 'Person 2'}
-PERSON2_SAFE_SPOT = {'x': -13.00, 'y': 15.00, 'yaw': 0.0} # Facing East
+PERSON2_SAFE_SPOT = {'x': -14.00, 'y': 15.00, 'yaw': 0.0}
 
 ROBOT_START = {'x': 2.12, 'y': -21.3, 'yaw': 1.57}
 
-# --- BALANCED DETECTION SETTINGS ---
-DETECTION_RADIUS = 1.5      # Increased to 1.5m (was 1.0m)
-MAX_OBJECT_WIDTH = 1.2      # Increased to 1.2m (was 1.0m)
+# --- SMART DETECTION SETTINGS ---
+DETECTION_RADIUS = 2.5      
 MAP_THRESHOLD = 50          
-SEARCH_TOLERANCE = 4        # Reduced to 4 pixels (~12cm) to avoid deleting people near walls
+SEARCH_TOLERANCE = 2        
+CLUSTER_TOLERANCE = 0.5     # Points >0.5m apart belong to different objects
+PERSON_WIDTH_MAX = 1.0      # Max width for a human cluster
 
 class WarehouseController(Node):
     def __init__(self):
@@ -66,7 +68,7 @@ class WarehouseController(Node):
         self.handle_reset_on_restart()
 
         self.startup_timer = self.create_timer(2.0, self.startup_check)
-        self.get_logger().info('Initialized BALANCED TUNING. Waiting for Map...')
+        self.get_logger().info('Initialized SMART CLUSTERING. Waiting for Map...')
 
     # =========================================================================
     # CALLBACKS
@@ -131,66 +133,78 @@ class WarehouseController(Node):
 
     def is_static_object(self, wx, wy):
         if self.map_data is None: return False
-        
         mx = int((wx - self.map_info.origin.position.x) / self.map_info.resolution)
         my = int((wy - self.map_info.origin.position.y) / self.map_info.resolution)
-
-        if not (0 <= mx < self.map_info.width and 0 <= my < self.map_info.height):
-            return False
+        if not (0 <= mx < self.map_info.width and 0 <= my < self.map_info.height): return False
 
         r = SEARCH_TOLERANCE
         for dx in range(-r, r + 1):
             for dy in range(-r, r + 1):
                 check_x, check_y = mx + dx, my + dy
                 if 0 <= check_x < self.map_info.width and 0 <= check_y < self.map_info.height:
-                        if self.map_data[check_y, check_x] > MAP_THRESHOLD:
-                            return True
+                        if self.map_data[check_y, check_x] > MAP_THRESHOLD: return True
         return False
 
     def detect_person(self, expected_x, expected_y, name):
-        self.get_logger().info(f'Scanning for {name} at ({expected_x}, {expected_y})...')
-        
+        self.get_logger().info(f'Scanning for {name}...')
         pose = self.get_robot_pose()
-        if not pose or not self.latest_scan:
-            return False, None
+        if not pose or not self.latest_scan: return False, None
 
         rx, ry, ryaw = pose
-        dynamic_points = []
         
+        # 1. Gather ALL dynamic points
+        raw_points = []
         for i, r in enumerate(self.latest_scan.ranges):
             if r < 0.5 or r > 8.0 or not math.isfinite(r): continue
-
             angle = ryaw + self.latest_scan.angle_min + (i * self.latest_scan.angle_increment)
             wx = rx + r * math.cos(angle)
             wy = ry + r * math.sin(angle)
-
             if not self.is_static_object(wx, wy):
-                dynamic_points.append((wx, wy))
+                raw_points.append((wx, wy))
 
-        nearby_points = []
-        for wx, wy in dynamic_points:
-            dist = math.sqrt((wx - expected_x)**2 + (wy - expected_y)**2)
-            if dist < DETECTION_RADIUS:
-                nearby_points.append((wx, wy))
+        # 2. CLUSTER POINTS (Split continuous lines into separate objects)
+        clusters = []
+        if raw_points:
+            current_cluster = [raw_points[0]]
+            for i in range(1, len(raw_points)):
+                px, py = raw_points[i]
+                prev_x, prev_y = raw_points[i-1]
+                dist = math.sqrt((px - prev_x)**2 + (py - prev_y)**2)
+                
+                if dist < CLUSTER_TOLERANCE:
+                    current_cluster.append((px, py))
+                else:
+                    clusters.append(current_cluster)
+                    current_cluster = [(px, py)]
+            clusters.append(current_cluster)
 
-        if len(nearby_points) > 3:
-            min_x = min(p[0] for p in nearby_points)
-            max_x = max(p[0] for p in nearby_points)
-            min_y = min(p[1] for p in nearby_points)
-            max_y = max(p[1] for p in nearby_points)
+        self.get_logger().info(f'Found {len(clusters)} dynamic clusters.')
+
+        # 3. ANALYZE CLUSTERS
+        for cluster in clusters:
+            if len(cluster) < 3: continue # Ignore noise
+
+            # Calculate centroid
+            cx = sum(p[0] for p in cluster) / len(cluster)
+            cy = sum(p[1] for p in cluster) / len(cluster)
+
+            # Check Distance to Target
+            dist_to_target = math.sqrt((cx - expected_x)**2 + (cy - expected_y)**2)
+            if dist_to_target > DETECTION_RADIUS: continue
+
+            # Check Width
+            min_x = min(p[0] for p in cluster); max_x = max(p[0] for p in cluster)
+            min_y = min(p[1] for p in cluster); max_y = max(p[1] for p in cluster)
             width = math.sqrt((max_x - min_x)**2 + (max_y - min_y)**2)
 
-            if width > MAX_OBJECT_WIDTH:
-                self.get_logger().info(f'Ignored object: Too wide ({width:.2f}m)')
-                return False, None
-            else:
-                cx = sum(p[0] for p in nearby_points) / len(nearby_points)
-                cy = sum(p[1] for p in nearby_points) / len(nearby_points)
+            if width < PERSON_WIDTH_MAX:
                 self.get_logger().info(f'FOUND {name} at ({cx:.2f}, {cy:.2f}) (Width: {width:.2f}m)')
                 return True, (cx, cy)
-        else:
-            self.get_logger().info(f'{name} NOT FOUND (Area is empty or matches wall)')
-            return False, None
+            else:
+                self.get_logger().info(f'Cluster too wide ({width:.2f}m) - likely wall.')
+
+        self.get_logger().info(f'{name} NOT FOUND.')
+        return False, None
 
     # =========================================================================
     # MISSION

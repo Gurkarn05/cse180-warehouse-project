@@ -3,7 +3,7 @@
 ## Team Members
 - Enresto Ruiz
 - Itzel Camacho
-- 
+- Gurkarn Singh
 
 ## Project Description
 Autonomous robot controller to detect and locate humans in a warehouse environment.

@@ -1,7 +1,9 @@
 # CSE 180 Warehouse Robot Final Project
 
 ## Team Members
-- [Add your names here]
+- Enresto Ruiz
+- Itzel Camacho
+- 
 
 ## Project Description
 Autonomous robot controller to detect and locate humans in a warehouse environment.
